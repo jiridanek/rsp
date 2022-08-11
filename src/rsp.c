@@ -12,8 +12,9 @@ int main()
 {
 
     char *argv[] = {
+            "cheating-router",
             "5101",
-            "localhost",
+            "127.0.0.1",
             "5201",
             NULL,
     };
