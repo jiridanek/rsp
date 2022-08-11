@@ -23,10 +23,10 @@ struct server_socket_event_data {
 };
 
 
-struct proxy_data {
-    struct epoll_event_handler* client;
-    struct epoll_event_handler* backend;
-};
+//struct proxy_data {
+//    struct epoll_event_handler* client;
+//    struct epoll_event_handler* backend;
+//};
 
 
 void on_client_read(void* closure, char* buffer, int len)

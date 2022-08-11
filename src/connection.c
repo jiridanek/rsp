@@ -1,3 +1,7 @@
+#define _GNU_SOURCE         /* See feature_test_macros(7) */
+
+#include <fcntl.h>
+
 #include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -6,6 +10,7 @@
 #include <sys/epoll.h>
 #include <netdb.h>
 #include <string.h>
+#include <stdbool.h>
 
 
 #include "epollinterface.h"
@@ -27,8 +32,8 @@ struct data_buffer_entry {
 
 void connection_really_close(struct epoll_event_handler* self)
 {
-    struct connection_closure* closure = (struct connection_closure* ) self->closure;
-    struct data_buffer_entry* next;
+    struct connection_closure *closure = (struct connection_closure *) self->closure;
+    struct data_buffer_entry *next;
     while (closure->write_buffer != NULL) {
         next = closure->write_buffer->next;
         if (!closure->write_buffer->is_close_message) {
@@ -37,6 +42,8 @@ void connection_really_close(struct epoll_event_handler* self)
         epoll_add_to_free_list(closure->write_buffer);
         closure->write_buffer = next;
     }
+    close(closure->pipefd[0]);
+    close(closure->pipefd[1]);
 
     epoll_remove_handler(self);
     close(self->fd);
@@ -55,9 +62,12 @@ void connection_on_close_event(struct epoll_event_handler* self)
     connection_close(self);
 }
 
-
+// original version of in event handling has unlimited buffer space...
 void connection_on_out_event(struct epoll_event_handler* self)
 {
+    perror("can't do this, dave");
+//    exit(1);
+
     struct connection_closure* closure = (struct connection_closure*) self->closure;
     int written;
     int to_write;
@@ -95,15 +105,24 @@ void connection_on_out_event(struct epoll_event_handler* self)
 }
 
 
-void connection_on_in_event(struct epoll_event_handler* self)
-{
-    struct connection_closure* closure = (struct connection_closure*) self->closure;
-    char read_buffer[BUFFER_SIZE];
-    int bytes_read;
+void connection_on_in_event(struct epoll_event_handler* self) {
+    struct connection_closure *closure = (struct connection_closure *) self->closure;
 
-    while ((bytes_read = read(self->fd, read_buffer, BUFFER_SIZE)) != -1 && bytes_read != 0) {
-        if (bytes_read == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return;
+    // https://blog.superpat.com/zero-copy-in-linux-with-sendfile-and-splice
+    while(true) {
+        ssize_t bytes_read;
+        if ((bytes_read = splice(self->fd, NULL, closure->pipefd[1], NULL,
+                                 8 * 1024,
+                                 SPLICE_F_MORE | SPLICE_F_MOVE)) <= 0) {
+            if (errno == EINTR || errno == EAGAIN) {
+                // Interrupted system call/try again
+                // we would get epoll event to continue later, so lets quit for now
+                return;
+            }
+
+            perror("splice");
+            exit(1);
+
         }
 
         if (bytes_read == 0 || bytes_read == -1) {
@@ -111,15 +130,57 @@ void connection_on_in_event(struct epoll_event_handler* self)
             return;
         }
 
-        if (closure->on_read != NULL) {
-            closure->on_read(closure->on_read_closure, read_buffer, bytes_read);
+        // extract read_closure
+        struct proxy_data *read_closure = (struct proxy_data *) closure->on_read_closure;
+
+        ssize_t bytes_in_pipe = bytes_read;
+        while (bytes_in_pipe > 0) {
+            ssize_t bytes;
+            int fdout = self->fd == read_closure->client->fd ? read_closure->backend->fd : read_closure->client->fd;
+            if ((bytes = splice(closure->pipefd[0], NULL, fdout, NULL, bytes_in_pipe,
+                                SPLICE_F_MORE | SPLICE_F_MOVE)) <= 0) {
+                if (errno == EINTR || errno == EAGAIN) {
+                    // Interrupted system call/try again
+                    // we will get epoll event to empty this later
+//                    return;
+                    continue; // lets actually retry this
+                }
+                perror("splice");
+                exit(-1);
+            }
+            bytes_in_pipe -= bytes;
         }
     }
 }
 
 
-void connection_handle_event(struct epoll_event_handler* self, uint32_t events)
-{
+//    total_bytes_sent += bytes_sent;
+
+//    char read_buffer[BUFFER_SIZE];
+//    int bytes_read;
+//
+//    while ((bytes_read = read(self->fd, read_buffer, BUFFER_SIZE)) != -1 && bytes_read != 0) {
+//        if (bytes_read == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+//            return;
+//        }
+//
+//        if (bytes_read == 0 || bytes_read == -1) {
+//            connection_on_close_event(self);
+//            return;
+//        }
+//
+//        if (bytes_read < BUFFER_SIZE) {
+//            printf("read %d, remaining %d\n", bytes_read, BUFFER_SIZE - bytes_read);
+//        }
+//
+//        if (closure->on_read != NULL) {
+//            closure->on_read(closure->on_read_closure, read_buffer, bytes_read);
+//        }
+//    }
+//}
+
+
+void connection_handle_event(struct epoll_event_handler *self, uint32_t events) {
     if (events & EPOLLOUT) {
         connection_on_out_event(self);
     }
@@ -135,8 +196,7 @@ void connection_handle_event(struct epoll_event_handler* self, uint32_t events)
 }
 
 
-void add_write_buffer_entry(struct connection_closure* closure, struct data_buffer_entry* new_entry) 
-{
+void add_write_buffer_entry(struct connection_closure* closure, struct data_buffer_entry* new_entry) {
     if (closure->write_buffer == NULL) {
         closure->write_buffer = new_entry;
         closure->last_buffer_entry = new_entry;
@@ -144,6 +204,12 @@ void add_write_buffer_entry(struct connection_closure* closure, struct data_buff
         closure->last_buffer_entry->next = new_entry;
         closure->last_buffer_entry = new_entry;
     }
+
+    int c = 0;
+    for (struct data_buffer_entry *e = closure->write_buffer; e != NULL; e = e->next) {
+        c++;
+    }
+//    printf("have %d buffers\n", c);
 }
 
 
@@ -171,6 +237,7 @@ void connection_write(struct epoll_event_handler* self, char* data, int len)
         written = 0;
     }
 
+    // so, it tries to write as much as it can, and then buffers what does not fit into outgoing socket, meaning we get epoll event later to write this
     int unwritten = len - written;
     struct data_buffer_entry* new_entry = malloc(sizeof(struct data_buffer_entry));
     new_entry->is_close_message = 0;
@@ -201,14 +268,18 @@ void connection_close(struct epoll_event_handler* self)
 }
 
 
-struct epoll_event_handler* create_connection(int client_socket_fd)
-{
+struct epoll_event_handler* create_connection(int client_socket_fd) {
     make_socket_non_blocking(client_socket_fd);
 
-    struct connection_closure* closure = malloc(sizeof(struct connection_closure));
+    struct connection_closure *closure = malloc(sizeof(struct connection_closure));
     closure->write_buffer = NULL;
+    // Setup the pipe at initialization time
+    if (pipe(closure->pipefd) < 0) {
+        perror("pipe");
+        exit(1);
+    }
 
-    struct epoll_event_handler* result = malloc(sizeof(struct epoll_event_handler));
+    struct epoll_event_handler *result = malloc(sizeof(struct epoll_event_handler));
     rsp_log("Created connection epoll handler %p", result);
     result->fd = client_socket_fd;
     result->handle = connection_handle_event;
