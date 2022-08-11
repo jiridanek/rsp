@@ -6,6 +6,7 @@ struct connection_closure {
     void* on_close_closure;
     
     struct data_buffer_entry* write_buffer;
+    struct data_buffer_entry* last_buffer_entry;
 };
 
 extern void connection_write(struct epoll_event_handler* self, char* data, int len);

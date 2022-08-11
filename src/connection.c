@@ -14,7 +14,7 @@
 #include "netutils.h"
 
 
-#define BUFFER_SIZE 4096
+const int BUFFER_SIZE = 32 * 1024;
 
 struct data_buffer_entry {
     int is_close_message;
@@ -137,13 +137,12 @@ void connection_handle_event(struct epoll_event_handler* self, uint32_t events)
 
 void add_write_buffer_entry(struct connection_closure* closure, struct data_buffer_entry* new_entry) 
 {
-    struct data_buffer_entry* last_buffer_entry;
     if (closure->write_buffer == NULL) {
         closure->write_buffer = new_entry;
+        closure->last_buffer_entry = new_entry;
     } else {
-        for (last_buffer_entry=closure->write_buffer; last_buffer_entry->next != NULL; last_buffer_entry=last_buffer_entry->next)
-            ;
-        last_buffer_entry->next = new_entry;
+        closure->last_buffer_entry->next = new_entry;
+        closure->last_buffer_entry = new_entry;
     }
 }
 
