@@ -9,12 +9,6 @@ project(
   DESCRIPTION ""
   LANGUAGES C)
 
-#add_library(TARGET_NAME_XXX SHARED src/empty_xxx.c)
-
-#todo remove luajit dep
-include_directories("/usr/include/luajit-2.1")
-link_libraries("luajit-5.1")
-
 add_executable(cheating-router
         src/connection.c
         src/epollinterface.c

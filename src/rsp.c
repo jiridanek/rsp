@@ -3,42 +3,26 @@
 #include <sys/epoll.h>
 #include <signal.h>
 
-#include <luajit.h>
-#include <lauxlib.h>
-
 #include "epollinterface.h"
 #include "logging.h"
 #include "server_socket.h"
 
 
-char* get_config_opt(lua_State* L, char* name) {
-    lua_getglobal(L, name);
-    if (!lua_isstring(L, -1)) {
-        fprintf(stderr, "%s must be a string", name);
-        exit(1);
-    }
-    return (char*) lua_tostring(L, -1);
-}
-
-
-int main(int argc, char* argv[])
+int main()
 {
-    if (argc != 2) {
-        fprintf(stderr, 
-                "Usage: %s <config_file>\n", 
-                argv[0]);
-        exit(1);
-    }
 
-    lua_State *L = lua_open();
-    if (luaL_dofile(L, argv[1]) != 0) {
-        fprintf(stderr, "Error parsing config file: %s\n", lua_tostring(L, -1));
-        exit(1);
-    }
-    char* server_port_str = get_config_opt(L, "listenPort");
-    char* backend_addr = get_config_opt(L, "backendAddress");
-    char* backend_port_str = get_config_opt(L, "backendPort");
+    char *argv[] = {
+            "5101",
+            "localhost",
+            "5201",
+            NULL,
+    };
 
+    char *server_port_str = argv[1];
+    char *backend_addr = argv[2];
+    char *backend_port_str = argv[3];
+
+    // https://stackoverflow.com/questions/21687695/getting-sigpipe-with-non-blocking-sockets-is-this-normal/
     signal(SIGPIPE, SIG_IGN);
 
     epoll_init();
