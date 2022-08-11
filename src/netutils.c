@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,8 +55,7 @@ int connect_to_backend(char* backend_host,
     struct addrinfo* addrs_iter;
     for (addrs_iter = addrs;
          addrs_iter != NULL;
-         addrs_iter = addrs_iter->ai_next)
-    {
+         addrs_iter = addrs_iter->ai_next) {
         backend_socket_fd = socket(addrs_iter->ai_family,
                                    addrs_iter->ai_socktype,
                                    addrs_iter->ai_protocol);
