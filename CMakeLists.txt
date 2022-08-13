@@ -9,6 +9,8 @@ project(
   DESCRIPTION ""
   LANGUAGES C)
 
+add_subdirectory(proton)
+
 add_executable(cheating-router
         src/connection.c
         src/epollinterface.c
