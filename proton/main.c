@@ -34,12 +34,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+enum {LISTENER_COUNT = 4};
+
 typedef struct app_data_t {
     const char *host, *port;
     const char *amqp_address;
 
     pn_proactor_t *proactor;
-    pn_listener_t *listener;
+    pn_listener_t *listeners[LISTENER_COUNT];
 
     pthread_mutex_t lock;
     int64_t first_idle_time;
@@ -71,7 +73,9 @@ static int exit_code = 0;
  */
 static void close_all(pn_raw_connection_t *c, app_data_t *app) {
     if (c) pn_raw_connection_close(c);
-    if (app->listener) pn_listener_close(app->listener);
+    for (int i=0; i < LISTENER_COUNT; i++) {
+        if (app->listeners[i]) pn_listener_close(app->listeners[i]);
+    }
 }
 
 static bool check_condition(pn_event_t *e, pn_condition_t *cond, app_data_t *app) {
@@ -297,7 +301,11 @@ static bool handle(app_data_t* app, pn_event_t* event) {
 
         case PN_LISTENER_CLOSE: {
             pn_listener_t *listener = pn_event_listener(event);
-            app->listener = NULL;        /* Listener is closed */
+            for (int i=0; i < LISTENER_COUNT; i++) {
+                if (listener == app->listeners[i]) {
+                    app->listeners[i] = NULL;        /* Listener is closed */
+                }
+            }
             printf("**listener closed\n");
             check_condition_fatal(event, pn_listener_condition(listener), app);
         } break;
@@ -314,7 +322,9 @@ static bool handle(app_data_t* app, pn_event_t* event) {
                     app->first_idle_time = now;
                 } else if (app->first_idle_time + 20000 <= now) {
                     printf("**no activity for %dms: shutting down now\n", timeout);
-                    pn_listener_close(app->listener);
+                    for (int i = 0; i< LISTENER_COUNT; i++) {
+                        pn_listener_close(app->listeners[i]);
+                    }
                     break; // No more timeouts
                 }
             } else if (now >= app->wake_conn_time) {
@@ -363,20 +373,21 @@ void* run(void *arg) {
 
 
 int main(int argc, char **argv) {
+    const size_t thread_count = 3;
+
     struct app_data_t app = {0};
     pthread_mutex_init(&app.lock, NULL);
 
-    char addr[PN_MAX_ADDR];
-    app.host = (argc > 1) ? argv[1] : "";
-    app.port = (argc > 2) ? argv[2] : "amqp";
-
     /* Create the proactor and connect */
     app.proactor = pn_proactor();
-    app.listener = pn_listener();
-    pn_proactor_addr(addr, sizeof(addr), app.host, app.port);
-    pn_proactor_listen(app.proactor, app.listener, addr, 16);
+    for (int i = 0; i < LISTENER_COUNT; i++) {
+        app.listeners[i] = pn_listener();
+    }
+    pn_proactor_listen(app.proactor, app.listeners[0], "localhost:5101", 16);
+    pn_proactor_listen(app.proactor, app.listeners[1], "localhost:5102", 16);
+    pn_proactor_listen(app.proactor, app.listeners[2], "localhost:5103", 16);
+    pn_proactor_listen(app.proactor, app.listeners[3], "localhost:5104", 16);
 
-    size_t thread_count = 3;
     pthread_t* threads = (pthread_t*)calloc(sizeof(pthread_t), thread_count);
     int n;
     for (n=0; n<thread_count; n++) {
