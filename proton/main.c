@@ -33,15 +33,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
-enum {LISTENER_COUNT = 4};
+const size_t thread_count = 1;
+enum {
+    MAX_CONNECTIONS = 50,
+    LISTENER_COUNT = 4,
+    READ_BUFFERS = 4,
+    READ_BUFFER_SIZE = 32 * 1024,
+};
 
 typedef struct app_data_t {
-    const char *host, *port;
-    const char *amqp_address;
-
     pn_proactor_t *proactor;
     pn_listener_t *listeners[LISTENER_COUNT];
+    const char *target_addrs[LISTENER_COUNT];
 
     pthread_mutex_t lock;
     int64_t first_idle_time;
@@ -54,10 +59,13 @@ typedef struct app_data_t {
     /* Receiver values */
 } app_data_t;
 
-#define MAX_CONNECTIONS 5
-
+// half-proxy, responsible for moving data from incoming_connection to outcoming_connection
+//
+// there are two half-proxies for every connection pair, one for each direction
 typedef struct conn_data_t {
-    pn_raw_connection_t *connection;
+    bool is_incoming;
+    pn_raw_connection_t *incoming_connection;
+    pn_raw_connection_t *outcoming_connection;
     int64_t last_recv_time;
     int bytes;
     int buffers;
@@ -98,10 +106,10 @@ static void check_condition_fatal(pn_event_t *e, pn_condition_t *cond, app_data_
 static void send_message(pn_raw_connection_t *c, const char* msg) {
     pn_raw_buffer_t buffer;
     uint32_t len = strlen(msg);
-    char *buf = (char*) malloc(1024);
+    char *buf = (char *) malloc(READ_BUFFER_SIZE);
     memcpy(buf, msg, len);
     buffer.bytes = buf;
-    buffer.capacity = 1024;
+    buffer.capacity = READ_BUFFER_SIZE;
     buffer.offset = 0;
     buffer.size = len;
     // If message not accepted just throw it away!
@@ -112,14 +120,14 @@ static void send_message(pn_raw_connection_t *c, const char* msg) {
 }
 
 static void recv_message(pn_raw_buffer_t buf) {
-    fwrite(buf.bytes, buf.size, 1, stdout);
+//    fwrite(buf.bytes, buf.size, 1, stdout);
 }
 
 conn_data_t *make_conn_data(pn_raw_connection_t *c) {
     int i;
     for (i = 0; i < MAX_CONNECTIONS; ++i) {
-        if (!conn_data[i].connection) {
-            conn_data[i].connection = c;
+        if (!conn_data[i].incoming_connection) {
+            conn_data[i].incoming_connection = c;
             return &conn_data[i];
         }
     }
@@ -128,10 +136,9 @@ conn_data_t *make_conn_data(pn_raw_connection_t *c) {
 
 void free_conn_data(conn_data_t *c) {
     if (!c) return;
-    c->connection = NULL;
+    c->incoming_connection = NULL;
+    c->outcoming_connection = NULL;
 }
-
-#define READ_BUFFERS 4
 
 static void free_buffers(pn_raw_buffer_t buffs[], size_t n) {
     unsigned i;
@@ -149,15 +156,19 @@ static void handle_receive(app_data_t *app, pn_event_t* event) {
             conn_data_t *cd = (conn_data_t *) pn_raw_connection_get_context(c);
             pn_raw_buffer_t buffers[READ_BUFFERS] = {{0}};
             if (cd) {
+                if (cd->is_incoming) {
+                    printf("**incoming raw connection %tu connected\n", cd - conn_data);
+                } else {
+                    printf("**outcoming raw connection %tu connected\n", cd - conn_data);
+                }
                 int i = READ_BUFFERS;
-                printf("**raw connection %tu connected\n", cd-conn_data);
                 pthread_mutex_lock(&app->lock);
                 app->connects++;
                 pthread_mutex_unlock(&app->lock);
                 for (; i; --i) {
-                    pn_raw_buffer_t *buff = &buffers[READ_BUFFERS-i];
-                    buff->bytes = (char*) malloc(1024);
-                    buff->capacity = 1024;
+                    pn_raw_buffer_t *buff = &buffers[READ_BUFFERS - i];
+                    buff->bytes = (char *) malloc(READ_BUFFER_SIZE);
+                    buff->capacity = READ_BUFFER_SIZE;
                     buff->size = 0;
                     buff->offset = 0;
                 }
@@ -166,13 +177,15 @@ static void handle_receive(app_data_t *app, pn_event_t* event) {
                 printf("**too many raw connections connected: closing\n");
                 pn_raw_connection_close(c);
             }
-        } break;
+        }
+            break;
 
-        case PN_RAW_CONNECTION_WAKE: {
-            pn_raw_connection_t *c = pn_event_raw_connection(event);
-            conn_data_t *cd = (conn_data_t *) pn_raw_connection_get_context(c);
-            printf("**raw connection %tu woken\n", cd-conn_data);
-        } break;
+//        don't log too much
+//        case PN_RAW_CONNECTION_WAKE: {
+//            pn_raw_connection_t *c = pn_event_raw_connection(event);
+//            conn_data_t *cd = (conn_data_t *) pn_raw_connection_get_context(c);
+//            printf("**raw connection %tu woken\n", cd-conn_data);
+//        } break;
 
         case PN_RAW_CONNECTION_DISCONNECTED: {
             pn_raw_connection_t *c = pn_event_raw_connection(event);
@@ -181,12 +194,15 @@ static void handle_receive(app_data_t *app, pn_event_t* event) {
                 pthread_mutex_lock(&app->lock);
                 app->disconnects++;
                 pthread_mutex_unlock(&app->lock);
-                printf("**raw connection %tu disconnected: bytes: %d, buffers: %d\n", cd-conn_data, cd->bytes, cd->buffers);
+//                pn_raw_connection_write_close(cd->outcoming_connection);
+                printf("**raw connection %tu disconnected: bytes: %d, buffers: %d\n", cd - conn_data, cd->bytes,
+                       cd->buffers);
             } else {
                 printf("**raw connection disconnected: not connected\n");
             }
             check_condition(event, pn_raw_connection_condition(c), app);
             pn_raw_connection_wake(c);
+//            pn_raw_connection_wake(cd->outcoming_connection);
             free_conn_data(cd);
         } break;
 
@@ -213,19 +229,26 @@ static void handle_receive(app_data_t *app, pn_event_t* event) {
             cd->last_recv_time = pn_proactor_now_64();
             while ( (n = pn_raw_connection_take_read_buffers(c, buffs, READ_BUFFERS)) ) {
                 unsigned i;
-                for (i=0; i<n && buffs[i].bytes; ++i) {
+                for (i = 0; i < n && buffs[i].bytes; ++i) {
                     cd->bytes += buffs[i].size;
                     recv_message(buffs[i]);
                 }
                 cd->buffers += n;
 
                 // Echo back if we can
-                if (!pn_raw_connection_is_write_closed(c)) {
-                    pn_raw_connection_write_buffers(c, buffs, n);
+                bool need_wake = false;
+                if (!pn_raw_connection_is_write_closed(cd->outcoming_connection)) {
+                    pn_raw_connection_write_buffers(cd->outcoming_connection, buffs, n);
+                    need_wake = true;
                 } else if (!pn_raw_connection_is_read_closed(c)) {
                     pn_raw_connection_give_read_buffers(c, buffs, n);
+                    need_wake = true;
                 } else {
                     free_buffers(buffs, n);
+                }
+                // if we wrote anything, inform the other connection
+                if (need_wake) {
+                    pn_raw_connection_wake(cd->outcoming_connection);
                 }
             }
         } break;
@@ -233,7 +256,7 @@ static void handle_receive(app_data_t *app, pn_event_t* event) {
         case PN_RAW_CONNECTION_CLOSED_READ: {
             pn_raw_connection_t *c = pn_event_raw_connection(event);
             if (!pn_raw_connection_is_write_closed(c)) {
-                send_message(c, "** Goodbye **");
+//                send_message(c, "** Goodbye **");
             }
         }
         case PN_RAW_CONNECTION_CLOSED_WRITE:{
@@ -242,22 +265,27 @@ static void handle_receive(app_data_t *app, pn_event_t* event) {
         } break;
         case PN_RAW_CONNECTION_WRITTEN: {
             pn_raw_connection_t *c = pn_event_raw_connection(event);
+            conn_data_t *cd = (conn_data_t *) pn_raw_connection_get_context(c);
             pn_raw_buffer_t buffs[READ_BUFFERS];
+            bool need_wake = false;
             size_t n;
-            while ( (n = pn_raw_connection_take_written_buffers(c, buffs, READ_BUFFERS)) ) {
-                if (!pn_raw_connection_is_read_closed(c)) {
-                    pn_raw_connection_give_read_buffers(c, buffs, n);
+            while ((n = pn_raw_connection_take_written_buffers(c, buffs, READ_BUFFERS))) {
+                if (!pn_raw_connection_is_read_closed(cd->outcoming_connection)) {
+                    pn_raw_connection_give_read_buffers(cd->outcoming_connection, buffs, n);
+                    need_wake = true;
                 } else {
                     free_buffers(buffs, n);
                 }
             };
+            // if we wrote anything, inform the other connection
+            if (need_wake) {
+                pn_raw_connection_wake(cd->outcoming_connection);
+            }
         } break;
         default:
             break;
     }
 }
-
-#define WRITE_BUFFERS 4
 
 /* Handle all events, delegate to handle_send or handle_receive
    Return true to continue, false to exit
@@ -273,29 +301,45 @@ static bool handle(app_data_t* app, pn_event_t* event) {
             break;
         }
         case PN_LISTENER_ACCEPT: {
+            pn_proactor_t *proactor = pn_event_proactor(event);
             pn_listener_t *listener = pn_event_listener(event);
+
             pn_raw_connection_t *c = pn_raw_connection();
-            void *cd = make_conn_data(c);
-            int64_t now = pn_proactor_now_64();
+            conn_data_t *icd = make_conn_data(c);
 
-            if (cd) {
-                pthread_mutex_lock(&app->lock);
-                app->first_idle_time = 0;
-                if (app->wake_conn_time < now) {
-                    app->wake_conn_time = now + 5000;
-                    pn_proactor_set_timeout(pn_listener_proactor(listener), 5000);
-                }
-                pn_raw_connection_set_context(c, cd);
+            pn_raw_connection_t *o = pn_raw_connection();
+            conn_data_t *ocd = make_conn_data(o);
 
-                pn_listener_raw_accept(listener, c);
-                pthread_mutex_unlock(&app->lock);
-            } else {
+            if (icd == NULL || ocd == NULL) {
                 printf("**too many connections, trying again later...\n");
 
                 /* No other sensible/correct way to reject connection - have to defer closing to event handler */
                 pn_raw_connection_set_context(c, 0);
                 pn_listener_raw_accept(listener, c);
             }
+
+            const int i = (int) pn_listener_get_context(listener);
+            const char *target_addr = app->target_addrs[i];
+
+            pn_proactor_raw_connect(proactor, o, target_addr);
+            icd->is_incoming = true;
+            icd->outcoming_connection = o;
+            ocd->is_incoming = false;
+            ocd->outcoming_connection = c;
+
+            int64_t now = pn_proactor_now_64();
+
+            pthread_mutex_lock(&app->lock);
+            app->first_idle_time = 0;
+            if (app->wake_conn_time < now) {
+                app->wake_conn_time = now + 5000;
+                pn_proactor_set_timeout(pn_listener_proactor(listener), 5000);
+            }
+            pn_raw_connection_set_context(c, icd);
+            pn_raw_connection_set_context(o, ocd);
+
+            pn_listener_raw_accept(listener, c);
+            pthread_mutex_unlock(&app->lock);
 
         } break;
 
@@ -330,7 +374,7 @@ static bool handle(app_data_t* app, pn_event_t* event) {
             } else if (now >= app->wake_conn_time) {
                 int i;
                 for (i = 0; i < MAX_CONNECTIONS; ++i) {
-                    if (conn_data[i].connection) pn_raw_connection_wake(conn_data[i].connection);
+                    if (conn_data[i].incoming_connection) pn_raw_connection_wake(conn_data[i].incoming_connection);
                 }
                 app->wake_conn_time = now + 5000;
             }
@@ -371,9 +415,14 @@ void* run(void *arg) {
     return NULL;
 }
 
+static void add_listener(app_data_t *app, int i, const char *addr, const char *target_addr) {
+    assert (i < LISTENER_COUNT);
+    app->target_addrs[i] = target_addr;
+    pn_proactor_listen(app->proactor, app->listeners[i], addr, 16);
+    pn_listener_set_context(app->listeners[i], (void *) i);
+}
 
 int main(int argc, char **argv) {
-    const size_t thread_count = 3;
 
     struct app_data_t app = {0};
     pthread_mutex_init(&app.lock, NULL);
@@ -383,25 +432,28 @@ int main(int argc, char **argv) {
     for (int i = 0; i < LISTENER_COUNT; i++) {
         app.listeners[i] = pn_listener();
     }
-    pn_proactor_listen(app.proactor, app.listeners[0], "localhost:5101", 16);
-    pn_proactor_listen(app.proactor, app.listeners[1], "localhost:5102", 16);
-    pn_proactor_listen(app.proactor, app.listeners[2], "localhost:5103", 16);
-    pn_proactor_listen(app.proactor, app.listeners[3], "localhost:5104", 16);
+    add_listener(&app, 0, "localhost:5101", "127.0.0.1:5201");
+    add_listener(&app, 1, "localhost:5102", "127.0.0.1:5202");
+    add_listener(&app, 2, "localhost:5103", "127.0.0.1:5203");
+    add_listener(&app, 3, "localhost:5104", "127.0.0.1:5204");
 
-    pthread_t* threads = (pthread_t*)calloc(sizeof(pthread_t), thread_count);
+    pthread_t *threads = (pthread_t *) calloc(sizeof(pthread_t), thread_count);
     int n;
-    for (n=0; n<thread_count; n++) {
-        int rc = pthread_create(&threads[n], 0, run, (void*)&app);
+    for (n = 0; n < thread_count; n++) {
+        int rc = pthread_create(&threads[n], 0, run, (void *) &app);
         if (rc) {
             fprintf(stderr, "Failed to create thread\n");
             exit(-1);
         }
     }
-    run(&app);
 
-    for (n=0; n<thread_count; n++) {
+//    don't do work on main thread
+//    run(&app);
+
+    for (n = 0; n < thread_count; n++) {
         pthread_join(threads[n], 0);
     }
+    free(threads);
 
     pn_proactor_free(app.proactor);
     return exit_code;
