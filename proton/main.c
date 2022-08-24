@@ -38,9 +38,9 @@
 const size_t thread_count = 1;
 enum {
     MAX_CONNECTIONS = 50,
-    LISTENER_COUNT = 4,
-    READ_BUFFERS = 4,
-    READ_BUFFER_SIZE = 32 * 1024,
+    LISTENER_COUNT = 4,  // don't touch this!
+    READ_BUFFERS = 8,  // bigger is better
+    READ_BUFFER_SIZE = 32 * 1024,  // bigger is better
 };
 
 typedef struct app_data_t {
